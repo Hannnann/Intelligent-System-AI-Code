@@ -1,23 +1,7 @@
 """
 ================================================================================
-DERMNET SKIN DISEASE DETECTION — MULTI-AGENT SYSTEM (600+ LINES, FULL A→Z)
+DERMNET SKIN DISEASE DETECTION — MULTI-AGENT SYSTEM
 ================================================================================
-
-WHAT YOU WANTED:
-- DermNet only (skip HAM10000)
-- Multi-agent system
-- Full working code A→Z (training + eval + calibration + export + inference)
-- Notebook-safe CLI (Colab/Jupyter won't crash with "-f ...json")
-- Fix stratified split error: "least populated class has only 1 member"
-
-THE REAL ISSUE YOU HIT:
-- DermNet datasets often contain classes with 1–4 images.
-- Stratified splitting fails when ANY class has < 2 samples.
-- Even if it "works", tiny classes destroy model quality and trust.
-
-PRODUCTION FIX (included here):
-- Filter out classes with < MIN_SAMPLES_PER_CLASS (default 5)
-- This is standard practice in real ML pipelines.
 
 EXPECTED DATASET STRUCTURE:
   /content/drive/MyDrive/datasets/dermnet/
