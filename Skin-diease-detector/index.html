@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Skin Disease Detection</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <h1>DermNet Skin Disease Detection</h1>
+        <p>Drag and drop an image to get the skin disease prediction.</p>
+
+        <!-- Drag-and-drop section -->
+        <div class="drop-area" id="dropArea">
+            <p id="dropText">Drag & Drop Image Here</p>
+            <input type="file" id="imageInput" accept="image/*" style="display: none;">
+            <div id="previewContainer" class="hidden">
+                <img id="previewImage" src="" alt="Preview" class="preview-img">
+            </div>
+        </div>
+
+        <button onclick="uploadImage()">Upload</button>
+
+        <div id="loading" class="hidden">
+            <p>Loading... Please wait.</p>
+        </div>
+
+        <div id="result" class="hidden">
+            <h2>Prediction Result:</h2>
+            <div id="diseaseType"></div>
+            <div id="confidence"></div>
+            <div id="disclaimer"></div>
+        </div>
+
+        <div id="error" class="hidden">
+            <p>Sorry, something went wrong. Please try again.</p>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
