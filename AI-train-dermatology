@@ -1,0 +1,1403 @@
+"""
+================================================================================
+DERMNET SKIN DISEASE DETECTION — MULTI-AGENT SYSTEM (600+ LINES, FULL A→Z)
+================================================================================
+
+WHAT YOU WANTED:
+- DermNet only (skip HAM10000)
+- Multi-agent system
+- Full working code A→Z (training + eval + calibration + export + inference)
+- Notebook-safe CLI (Colab/Jupyter won't crash with "-f ...json")
+- Fix stratified split error: "least populated class has only 1 member"
+
+THE REAL ISSUE YOU HIT:
+- DermNet datasets often contain classes with 1–4 images.
+- Stratified splitting fails when ANY class has < 2 samples.
+- Even if it "works", tiny classes destroy model quality and trust.
+
+PRODUCTION FIX (included here):
+- Filter out classes with < MIN_SAMPLES_PER_CLASS (default 5)
+- This is standard practice in real ML pipelines.
+
+EXPECTED DATASET STRUCTURE:
+  /content/drive/MyDrive/datasets/dermnet/
+      acne/
+         img1.jpg
+         img2.png
+      eczema/
+         ...
+      psoriasis/
+         ...
+      ...
+
+INSTALL (Colab / Local):
+  pip install -U torch torchvision torchaudio timm numpy pillow scikit-learn tqdm matplotlib
+
+RUN (Colab):
+  python dermnet_multi_agent_600plus.py \
+      --data_dir "/content/drive/MyDrive/datasets/dermnet" \
+      --train --calibrate --export
+
+If you run with no flags, it will do everything by default.
+
+DISCLAIMER:
+- This is NOT a medical diagnosis tool.
+- Output must be shown as "AI suggestion" + "consult clinician".
+================================================================================
+"""
+
+# ==============================================================================
+# 0) IMPORTS
+# ==============================================================================
+
+from __future__ import annotations
+
+import os
+import io
+import sys
+import json
+import math
+import time
+import glob
+import random
+import argparse
+import hashlib
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Tuple, Optional, Any
+
+import numpy as np
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+
+import torchvision.transforms as T
+
+from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    classification_report,
+    confusion_matrix,
+    top_k_accuracy_score,
+)
+
+import matplotlib.pyplot as plt
+
+
+# ==============================================================================
+# 1) UTILITIES
+# ==============================================================================
+
+def seed_everything(seed: int = 42) -> None:
+    """
+    Set random seeds for reproducibility.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    # Deterministic for reproducibility (slower but stable)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def now_ts() -> str:
+    return time.strftime("%Y%m%d_%H%M%S")
+
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def human_time(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    if seconds < 3600:
+        return f"{seconds/60:.1f}m"
+    return f"{seconds/3600:.1f}h"
+
+
+def save_json(obj: Any, path: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+
+
+def load_json(path: str) -> Any:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def softmax_numpy(x: np.ndarray, axis: int = 1) -> np.ndarray:
+    """
+    Stable softmax.
+    """
+    x = x - np.max(x, axis=axis, keepdims=True)
+    e = np.exp(x)
+    return e / np.sum(e, axis=axis, keepdims=True)
+
+
+def sha1_file(path: str, chunk_size: int = 1024 * 1024) -> str:
+    """
+    Exact duplicate detection (content hash).
+    """
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk_size)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def plot_confusion_matrix(cm: np.ndarray, labels: List[str], out_path: str) -> None:
+    """
+    Saves confusion matrix image.
+    """
+    fig = plt.figure(figsize=(12, 10))
+    plt.imshow(cm, interpolation="nearest")
+    plt.title("Confusion Matrix")
+    plt.colorbar()
+    ticks = np.arange(len(labels))
+    plt.xticks(ticks, labels, rotation=45, ha="right")
+    plt.yticks(ticks, labels)
+
+    thresh = cm.max() / 2.0 if cm.max() > 0 else 1.0
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            plt.text(
+                j, i, f"{cm[i, j]}",
+                ha="center", va="center",
+                color="white" if cm[i, j] > thresh else "black"
+            )
+    plt.tight_layout()
+    plt.ylabel("True label")
+    plt.xlabel("Predicted label")
+    plt.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
+# ==============================================================================
+# 2) CONFIGURATION
+# ==============================================================================
+
+@dataclass
+class TrainConfig:
+    # Dataset
+    data_dir: str = "./dermnet"
+    img_size: int = 300
+
+    # IMPORTANT FIX: Minimum images per class for stratified split and stability
+    min_samples_per_class: int = 5
+
+    # Splits
+    train_ratio: float = 0.70
+    val_ratio: float = 0.15
+    test_ratio: float = 0.15
+
+    # Loader
+    batch_size: int = 16
+    num_workers: int = 2
+    pin_memory: bool = True
+
+    # Training
+    epochs: int = 25
+    lr: float = 2e-4
+    weight_decay: float = 1e-4
+    label_smoothing: float = 0.0
+    grad_clip_norm: float = 1.0
+    use_amp: bool = True
+    early_stop_patience: int = 6
+
+    # Model
+    model_name: str = "efficientnet_b3"
+    pretrained: bool = True
+    dropout: float = 0.2
+
+    # Imbalance handling
+    use_weighted_sampler: bool = True
+    use_class_weights: bool = False  # optional
+
+    # Calibration
+    calibrate_max_iter: int = 2000
+    calibrate_lr: float = 0.01
+
+    # Inference safety
+    confidence_threshold: float = 0.55
+    skin_gate_enabled: bool = True
+
+    # Output
+    out_root: str = "./runs"
+    run_name: str = f"dermnet_agents_{now_ts()}"
+
+    # Repro
+    seed: int = 42
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# ==============================================================================
+# 3) AGENT 01 — IMAGE VALIDATION
+# ==============================================================================
+
+class ImageValidationAgent:
+    """
+    Checks if image can be opened/verified.
+    Keeps track of bad files.
+    """
+    def __init__(self):
+        self.bad_files: List[str] = []
+
+    def validate(self, path: str) -> bool:
+        try:
+            img = Image.open(path)
+            img.verify()
+            return True
+        except Exception:
+            self.bad_files.append(path)
+            return False
+
+    def report(self) -> Dict[str, Any]:
+        return {
+            "bad_files_count": len(self.bad_files),
+            "bad_files_sample": self.bad_files[:25],
+        }
+
+
+# ==============================================================================
+# 4) AGENT 02 — SKIN PRESENCE GATE (HEURISTIC)
+# ==============================================================================
+
+class SkinPresenceAgent:
+    """
+    Simple heuristic gate to reduce completely wrong inputs.
+    Not perfect. Just a guardrail.
+    """
+    def is_likely_skin(self, img: Image.Image) -> bool:
+        try:
+            small = img.convert("RGB").resize((64, 64))
+            arr = np.asarray(small).astype(np.float32)
+            mean = arr.mean()
+            std = arr.std()
+
+            # reject extreme lighting or near-flat images
+            if mean < 25 or mean > 235:
+                return False
+            if std < 8:
+                return False
+            return True
+        except Exception:
+            return False
+
+
+# ==============================================================================
+# 5) AGENT 03 — DATASET INDEXING (DERMNET FOLDER-PER-CLASS) + DEDUP
+# ==============================================================================
+
+class DatasetIndexAgent:
+    """
+    Builds paths/labels from folder structure:
+      data_dir/class_name/*.jpg
+    Includes:
+    - image validation
+    - optional dedup by sha1
+    - class-count filtering (min_samples_per_class) to fix stratified split
+    """
+
+    SUPPORTED_EXT = (".jpg", ".jpeg", ".png", ".webp")
+
+    def __init__(self, cfg: TrainConfig):
+        self.cfg = cfg
+        self.validator = ImageValidationAgent()
+
+    def _class_dirs(self) -> List[str]:
+        classes = []
+        for name in os.listdir(self.cfg.data_dir):
+            p = os.path.join(self.cfg.data_dir, name)
+            if os.path.isdir(p):
+                classes.append(name)
+        return sorted(classes)
+
+    def _gather(self, enable_dedup: bool = True) -> Tuple[List[str], List[str], Dict[str, Any]]:
+        """
+        Returns:
+          - image_paths
+          - class_names_per_image
+          - meta
+        """
+        if not os.path.isdir(self.cfg.data_dir):
+            raise FileNotFoundError(f"data_dir not found: {self.cfg.data_dir}")
+
+        classes = self._class_dirs()
+        if len(classes) < 2:
+            raise RuntimeError("Need at least 2 class folders in data_dir.")
+
+        seen_hashes = {}
+        dedup_removed = 0
+
+        image_paths: List[str] = []
+        image_classes: List[str] = []
+
+        for cls in classes:
+            folder = os.path.join(self.cfg.data_dir, cls)
+            for fn in os.listdir(folder):
+                if not fn.lower().endswith(self.SUPPORTED_EXT):
+                    continue
+                p = os.path.join(folder, fn)
+
+                if not self.validator.validate(p):
+                    continue
+
+                if enable_dedup:
+                    h = sha1_file(p)
+                    if h in seen_hashes:
+                        dedup_removed += 1
+                        continue
+                    seen_hashes[h] = p
+
+                image_paths.append(p)
+                image_classes.append(cls)
+
+        # meta before filtering
+        meta = {
+            "classes_found": classes,
+            "num_images_raw": len(image_paths),
+            "dedup_removed": dedup_removed,
+            "validation": self.validator.report(),
+        }
+        return image_paths, image_classes, meta
+
+    def _filter_rare_classes(self, image_paths: List[str], image_classes: List[str]) -> Tuple[List[str], List[str], Dict[str, Any]]:
+        """
+        Production fix:
+        Remove classes with < min_samples_per_class.
+        """
+        # count per class
+        counts: Dict[str, int] = {}
+        for c in image_classes:
+            counts[c] = counts.get(c, 0) + 1
+
+        min_n = int(self.cfg.min_samples_per_class)
+        keep_classes = sorted([c for c, n in counts.items() if n >= min_n])
+        drop_classes = sorted([c for c, n in counts.items() if n < min_n])
+
+        keep_set = set(keep_classes)
+
+        f_paths: List[str] = []
+        f_classes: List[str] = []
+        for p, c in zip(image_paths, image_classes):
+            if c in keep_set:
+                f_paths.append(p)
+                f_classes.append(c)
+
+        meta = {
+            "min_samples_per_class": min_n,
+            "kept_classes": keep_classes,
+            "dropped_classes": drop_classes,
+            "kept_class_count": len(keep_classes),
+            "dropped_class_count": len(drop_classes),
+            "images_after_filter": len(f_paths),
+        }
+        return f_paths, f_classes, meta
+
+    def run(self, enable_dedup: bool = True) -> Tuple[List[str], np.ndarray, Dict[str, int], Dict[int, str], Dict[str, Any]]:
+        raw_paths, raw_classes, meta_raw = self._gather(enable_dedup=enable_dedup)
+        f_paths, f_classes, meta_filter = self._filter_rare_classes(raw_paths, raw_classes)
+
+        if len(f_paths) < 200:
+            print("[IndexAgent] WARNING: Very small dataset after filtering. Results may be unstable.")
+
+        classes_final = sorted(list(set(f_classes)))
+        label2idx = {c: i for i, c in enumerate(classes_final)}
+        idx2label = {i: c for c, i in label2idx.items()}
+
+        labels = np.array([label2idx[c] for c in f_classes], dtype=np.int64)
+
+        meta = {
+            **meta_raw,
+            **meta_filter,
+            "final_num_classes": len(classes_final),
+            "final_num_images": len(f_paths),
+        }
+
+        print(f"[IndexAgent] Final classes={len(classes_final)} | images={len(f_paths)}")
+        print(f"[IndexAgent] Dropped rare classes (<{self.cfg.min_samples_per_class}) = {meta_filter['dropped_class_count']}")
+
+        return f_paths, labels, label2idx, idx2label, meta
+
+
+# ==============================================================================
+# 6) AGENT 04 — STRATIFIED SPLIT AGENT
+# ==============================================================================
+
+class SplitAgent:
+    """
+    Stratified train/val/test splitting.
+    Saves splits for reproducibility.
+    """
+
+    def __init__(self, cfg: TrainConfig):
+        self.cfg = cfg
+
+    def run(self, labels: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        total = self.cfg.train_ratio + self.cfg.val_ratio + self.cfg.test_ratio
+        if not math.isclose(total, 1.0, rel_tol=1e-4):
+            raise ValueError("train_ratio + val_ratio + test_ratio must sum to 1.0")
+
+        idx = np.arange(len(labels))
+
+        # train vs temp
+        sss1 = StratifiedShuffleSplit(
+            n_splits=1,
+            test_size=(1.0 - self.cfg.train_ratio),
+            random_state=self.cfg.seed
+        )
+        train_idx, temp_idx = next(sss1.split(idx, labels))
+
+        # val vs test inside temp
+        y_temp = labels[temp_idx]
+        test_portion = self.cfg.test_ratio / (self.cfg.val_ratio + self.cfg.test_ratio)
+
+        sss2 = StratifiedShuffleSplit(
+            n_splits=1,
+            test_size=test_portion,
+            random_state=self.cfg.seed
+        )
+        val_rel, test_rel = next(sss2.split(np.arange(len(temp_idx)), y_temp))
+
+        val_idx = temp_idx[val_rel]
+        test_idx = temp_idx[test_rel]
+        return train_idx, val_idx, test_idx
+
+    def save(self, out_dir: str, train_idx: np.ndarray, val_idx: np.ndarray, test_idx: np.ndarray) -> str:
+        ensure_dir(out_dir)
+        path = os.path.join(out_dir, "splits.json")
+        save_json({
+            "train_idx": train_idx.tolist(),
+            "val_idx": val_idx.tolist(),
+            "test_idx": test_idx.tolist(),
+        }, path)
+        return path
+
+
+# ==============================================================================
+# 7) DATASET + TRANSFORMS AGENT
+# ==============================================================================
+
+class DermNetDataset(Dataset):
+    """
+    Dataset that reads images from disk.
+    """
+    def __init__(self, paths: List[str], labels: np.ndarray, transform: T.Compose):
+        self.paths = paths
+        self.labels = labels
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, i: int) -> Tuple[torch.Tensor, int]:
+        p = self.paths[i]
+        y = int(self.labels[i])
+        img = Image.open(p).convert("RGB")
+        x = self.transform(img)
+        return x, y
+
+
+class TransformAgent:
+    """
+    Standard augmentations (not too aggressive).
+    """
+    def __init__(self, cfg: TrainConfig):
+        self.cfg = cfg
+
+    def train_tf(self) -> T.Compose:
+        s = self.cfg.img_size
+        return T.Compose([
+            T.Resize((s, s)),
+            T.RandomHorizontalFlip(p=0.5),
+            T.RandomRotation(degrees=15),
+            T.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.10, hue=0.02),
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+
+    def eval_tf(self) -> T.Compose:
+        s = self.cfg.img_size
+        return T.Compose([
+            T.Resize((s, s)),
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+
+
+# ==============================================================================
+# 8) AGENT 05 — CLASS IMBALANCE AGENT
+# ==============================================================================
+
+class ClassImbalanceAgent:
+    """
+    Weighted sampler and/or class weights.
+    """
+    def __init__(self, cfg: TrainConfig):
+        self.cfg = cfg
+
+    def compute_class_weights(self, labels: np.ndarray, num_classes: int) -> torch.Tensor:
+        counts = np.bincount(labels, minlength=num_classes).astype(np.float64)
+        weights = 1.0 / np.maximum(counts, 1.0)
+        weights = weights / weights.sum() * num_classes
+        return torch.tensor(weights, dtype=torch.float32)
+
+    def build_sampler(self, labels: np.ndarray) -> WeightedRandomSampler:
+        counts = np.bincount(labels)
+        w = 1.0 / np.maximum(counts, 1)
+        sample_w = w[labels]
+        sample_w = torch.tensor(sample_w, dtype=torch.double)
+        return WeightedRandomSampler(sample_w, num_samples=len(sample_w), replacement=True)
+
+
+# ==============================================================================
+# 9) AGENT 06 — MODEL AGENT
+# ==============================================================================
+
+class ModelAgent:
+    """
+    EfficientNet (timm) preferred; torchvision fallback.
+    """
+    def __init__(self, cfg: TrainConfig, num_classes: int):
+        self.cfg = cfg
+        self.num_classes = num_classes
+
+    def run(self) -> nn.Module:
+        try:
+            import timm
+            model = timm.create_model(
+                self.cfg.model_name,
+                pretrained=self.cfg.pretrained,
+                num_classes=self.num_classes,
+                drop_rate=self.cfg.dropout
+            )
+            print(f"[ModelAgent] Using timm model: {self.cfg.model_name}")
+            return model
+        except Exception as e:
+            print(f"[ModelAgent] timm not available. Falling back. ({e})")
+
+        import torchvision
+        base = torchvision.models.efficientnet_b3(
+            weights=torchvision.models.EfficientNet_B3_Weights.IMAGENET1K_V1 if self.cfg.pretrained else None
+        )
+        in_f = base.classifier[1].in_features
+        base.classifier[1] = nn.Linear(in_f, self.num_classes)
+        return base
+
+
+# ==============================================================================
+# 10) AGENT 07 — TRAINING AGENT (AMP + CLIP + COSINE + EARLY STOP)
+# ==============================================================================
+
+@dataclass
+class EpochMetrics:
+    epoch: int
+    train_loss: float
+    train_acc: float
+    val_loss: float
+    val_acc: float
+    val_f1_macro: float
+    val_top3: float
+    seconds: float
+
+
+class TrainingAgent:
+    """
+    Trains model with:
+    - AMP (if CUDA)
+    - gradient clipping
+    - cosine LR schedule
+    - early stopping
+    - best model saved to artifacts/best_model.pt
+    """
+    def __init__(self, cfg: TrainConfig):
+        self.cfg = cfg
+
+    def _loss_fn(self, class_weights: Optional[torch.Tensor] = None) -> nn.Module:
+        if self.cfg.label_smoothing > 0:
+            return nn.CrossEntropyLoss(weight=class_weights, label_smoothing=self.cfg.label_smoothing)
+        return nn.CrossEntropyLoss(weight=class_weights)
+
+    def _run_epoch(
+        self,
+        model: nn.Module,
+        loader: DataLoader,
+        loss_fn: nn.Module,
+        optimizer: Optional[optim.Optimizer],
+        scaler: Optional[torch.cuda.amp.GradScaler],
+        train: bool
+    ) -> Tuple[float, np.ndarray, np.ndarray]:
+        device = self.cfg.device
+        model.train(train)
+
+        losses = []
+        ys = []
+        logits_all = []
+
+        for x, y in tqdm(loader, desc="[Train]" if train else "[Val]", leave=False):
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+
+            if train:
+                optimizer.zero_grad(set_to_none=True)
+
+            with torch.cuda.amp.autocast(enabled=(self.cfg.use_amp and device.startswith("cuda"))):
+                logits = model(x)
+                loss = loss_fn(logits, y)
+
+            if train:
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+
+                    # Clip gradients
+                    if self.cfg.grad_clip_norm and self.cfg.grad_clip_norm > 0:
+                        scaler.unscale_(optimizer)
+                        nn.utils.clip_grad_norm_(model.parameters(), self.cfg.grad_clip_norm)
+
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    if self.cfg.grad_clip_norm and self.cfg.grad_clip_norm > 0:
+                        nn.utils.clip_grad_norm_(model.parameters(), self.cfg.grad_clip_norm)
+                    optimizer.step()
+
+            losses.append(float(loss.detach().cpu().item()))
+            ys.append(y.detach().cpu().numpy())
+            logits_all.append(logits.detach().cpu().numpy())
+
+        y_true = np.concatenate(ys, axis=0)
+        logits_np = np.concatenate(logits_all, axis=0)
+        return float(np.mean(losses)), y_true, logits_np
+
+    def run(
+        self,
+        model: nn.Module,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        num_classes: int,
+        out_dir: str,
+        class_weights: Optional[torch.Tensor] = None
+    ) -> Tuple[nn.Module, List[EpochMetrics], str]:
+        ensure_dir(out_dir)
+        device = self.cfg.device
+        model = model.to(device)
+
+        best_path = os.path.join(out_dir, "best_model.pt")
+
+        cw = class_weights.to(device) if (class_weights is not None and self.cfg.use_class_weights) else None
+        loss_fn = self._loss_fn(cw)
+
+        optimizer = optim.AdamW(model.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.cfg.epochs)
+
+        scaler = torch.cuda.amp.GradScaler(enabled=(self.cfg.use_amp and device.startswith("cuda")))
+
+        best_metric = -1e9
+        patience = 0
+        best_epoch = -1
+
+        history: List[EpochMetrics] = []
+
+        for epoch in range(1, self.cfg.epochs + 1):
+            t0 = time.time()
+
+            tr_loss, y_tr, logits_tr = self._run_epoch(
+                model, train_loader, loss_fn, optimizer, scaler, train=True
+            )
+            tr_pred = np.argmax(logits_tr, axis=1)
+            tr_acc = accuracy_score(y_tr, tr_pred)
+
+            with torch.no_grad():
+                va_loss, y_va, logits_va = self._run_epoch(
+                    model, val_loader, loss_fn, None, None, train=False
+                )
+
+            va_pred = np.argmax(logits_va, axis=1)
+            va_acc = accuracy_score(y_va, va_pred)
+            va_f1 = f1_score(y_va, va_pred, average="macro")
+
+            # top-3
+            try:
+                va_top3 = top_k_accuracy_score(y_va, logits_va, k=3, labels=list(range(num_classes)))
+            except Exception:
+                va_top3 = float("nan")
+
+            # choose best metric: macro F1 is safer with imbalance
+            metric_value = float(va_f1)
+
+            if metric_value > best_metric:
+                best_metric = metric_value
+                best_epoch = epoch
+                patience = 0
+                torch.save({
+                    "model_state": model.state_dict(),
+                    "epoch": epoch,
+                    "best_metric": best_metric,
+                    "metric_name": "val_f1_macro"
+                }, best_path)
+                print(f"[TrainingAgent] ✅ New best val_f1_macro={best_metric:.4f} at epoch {epoch} -> {best_path}")
+            else:
+                patience += 1
+                print(f"[TrainingAgent] No improvement. Patience {patience}/{self.cfg.early_stop_patience}")
+
+            scheduler.step()
+
+            t1 = time.time()
+            history.append(EpochMetrics(
+                epoch=epoch,
+                train_loss=float(tr_loss),
+                train_acc=float(tr_acc),
+                val_loss=float(va_loss),
+                val_acc=float(va_acc),
+                val_f1_macro=float(va_f1),
+                val_top3=float(va_top3) if not math.isnan(va_top3) else -1.0,
+                seconds=float(t1 - t0),
+            ))
+
+            print(
+                f"[TrainingAgent] ep {epoch:02d}/{self.cfg.epochs} | "
+                f"tr_loss={tr_loss:.4f} tr_acc={tr_acc:.4f} | "
+                f"va_loss={va_loss:.4f} va_acc={va_acc:.4f} va_f1={va_f1:.4f} | "
+                f"time={human_time(t1 - t0)}"
+            )
+
+            if patience >= self.cfg.early_stop_patience:
+                print(f"[TrainingAgent] ⛔ Early stopping at epoch {epoch}. Best epoch={best_epoch}")
+                break
+
+        # load best
+        ckpt = torch.load(best_path, map_location=device)
+        model.load_state_dict(ckpt["model_state"])
+        print(f"[TrainingAgent] Loaded best model from epoch {ckpt['epoch']} (val_f1_macro={ckpt['best_metric']:.4f})")
+        return model, history, best_path
+
+
+# ==============================================================================
+# 11) AGENT 08 — EVALUATION AGENT (REPORT + CONFUSION MATRIX)
+# ==============================================================================
+
+class EvaluationAgent:
+    def __init__(self, cfg: TrainConfig, idx2label: Dict[int, str]):
+        self.cfg = cfg
+        self.idx2label = idx2label
+
+    @torch.no_grad()
+    def predict_logits(self, model: nn.Module, loader: DataLoader) -> Tuple[np.ndarray, np.ndarray]:
+        device = self.cfg.device
+        model.eval()
+        ys = []
+        logits_all = []
+        for x, y in tqdm(loader, desc="[Eval] Predict", leave=False):
+            x = x.to(device, non_blocking=True)
+            logits = model(x)
+            logits_all.append(logits.detach().cpu().numpy())
+            ys.append(y.numpy())
+        return np.concatenate(ys), np.concatenate(logits_all)
+
+    def run(self, model: nn.Module, loader: DataLoader, title: str, out_dir: str) -> Dict[str, Any]:
+        ensure_dir(out_dir)
+        y_true, logits = self.predict_logits(model, loader)
+        probs = softmax_numpy(logits, axis=1)
+        y_pred = np.argmax(probs, axis=1)
+
+        acc = accuracy_score(y_true, y_pred)
+        f1 = f1_score(y_true, y_pred, average="macro")
+
+        labels_sorted = [self.idx2label[i] for i in sorted(self.idx2label.keys())]
+        report = classification_report(y_true, y_pred, target_names=labels_sorted, digits=4)
+        cm = confusion_matrix(y_true, y_pred)
+
+        report_path = os.path.join(out_dir, f"{title.lower()}_report.txt")
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(f"{title}\nacc={acc:.6f}\nf1_macro={f1:.6f}\n\n")
+            f.write(report)
+
+        cm_path = os.path.join(out_dir, f"{title.lower()}_confusion.png")
+        plot_confusion_matrix(cm, labels_sorted, cm_path)
+
+        print(f"[EvaluationAgent] {title}: acc={acc:.4f} f1_macro={f1:.4f}")
+        print(f"[EvaluationAgent] report -> {report_path}")
+        print(f"[EvaluationAgent] cm -> {cm_path}")
+
+        return {
+            "acc": float(acc),
+            "f1_macro": float(f1),
+            "report_path": report_path,
+            "confusion_path": cm_path,
+        }
+
+
+# ==============================================================================
+# 12) AGENT 09 — CALIBRATION (TEMPERATURE SCALING + ECE)
+# ==============================================================================
+
+def compute_ece(probs: np.ndarray, y_true: np.ndarray, n_bins: int = 15) -> float:
+    """
+    Expected Calibration Error.
+    """
+    conf = probs.max(axis=1)
+    pred = probs.argmax(axis=1)
+    acc = (pred == y_true).astype(np.float32)
+
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        lo, hi = bins[i], bins[i+1]
+        mask = (conf > lo) & (conf <= hi)
+        if mask.sum() == 0:
+            continue
+        bin_acc = acc[mask].mean()
+        bin_conf = conf[mask].mean()
+        ece += (mask.sum() / len(conf)) * abs(bin_acc - bin_conf)
+    return float(ece)
+
+
+class TemperatureScaler(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.log_temp = nn.Parameter(torch.zeros(1))
+
+    def forward(self, logits: torch.Tensor) -> torch.Tensor:
+        t = torch.exp(self.log_temp).clamp(min=1e-6)
+        return logits / t
+
+    def temperature(self) -> float:
+        return float(torch.exp(self.log_temp).detach().cpu().item())
+
+
+class CalibrationAgent:
+    def __init__(self, cfg: TrainConfig):
+        self.cfg = cfg
+
+    def run(self, val_logits: np.ndarray, val_labels: np.ndarray, out_dir: str) -> Dict[str, Any]:
+        ensure_dir(out_dir)
+        device = self.cfg.device
+
+        logits_t = torch.tensor(val_logits, dtype=torch.float32, device=device)
+        labels_t = torch.tensor(val_labels, dtype=torch.long, device=device)
+
+        scaler = TemperatureScaler().to(device)
+        optimizer = optim.Adam([scaler.log_temp], lr=self.cfg.calibrate_lr)
+        loss_fn = nn.CrossEntropyLoss()
+
+        best_loss = 1e18
+        best_state = None
+
+        for it in range(1, self.cfg.calibrate_max_iter + 1):
+            optimizer.zero_grad(set_to_none=True)
+            cal_logits = scaler(logits_t)
+            loss = loss_fn(cal_logits, labels_t)
+            loss.backward()
+            optimizer.step()
+
+            l = float(loss.detach().cpu().item())
+            if l < best_loss:
+                best_loss = l
+                best_state = scaler.state_dict()
+
+            if it % 250 == 0 or it == 1:
+                probs_raw = softmax_numpy(val_logits, axis=1)
+                probs_cal = softmax_numpy((val_logits / max(scaler.temperature(), 1e-6)), axis=1)
+                ece_raw = compute_ece(probs_raw, val_labels)
+                ece_cal = compute_ece(probs_cal, val_labels)
+                print(f"[Calibration] it={it:04d} loss={l:.6f} T={scaler.temperature():.4f} ECE raw={ece_raw:.4f} cal={ece_cal:.4f}")
+
+        if best_state is not None:
+            scaler.load_state_dict(best_state)
+
+        T_final = scaler.temperature()
+        probs_raw = softmax_numpy(val_logits, axis=1)
+        probs_cal = softmax_numpy((val_logits / max(T_final, 1e-6)), axis=1)
+
+        ece_raw = compute_ece(probs_raw, val_labels)
+        ece_cal = compute_ece(probs_cal, val_labels)
+
+        save_path = os.path.join(out_dir, "temperature_scaler.pt")
+        torch.save({
+            "state": scaler.state_dict(),
+            "temperature": T_final,
+            "best_loss": best_loss,
+            "ece_raw": ece_raw,
+            "ece_cal": ece_cal,
+        }, save_path)
+
+        print(f"[Calibration] ✅ Saved -> {save_path} (T={T_final:.4f}, ECE raw={ece_raw:.4f}, cal={ece_cal:.4f})")
+
+        return {
+            "temperature": float(T_final),
+            "ece_raw": float(ece_raw),
+            "ece_cal": float(ece_cal),
+            "path": save_path,
+        }
+
+
+# ==============================================================================
+# 13) AGENT 10 — SAFETY DECISION AGENT (TOP-K + UNCERTAIN)
+# ==============================================================================
+
+class SafetyDecisionAgent:
+    def __init__(self, cfg: TrainConfig, idx2label: Dict[int, str]):
+        self.cfg = cfg
+        self.idx2label = idx2label
+
+    def decide(self, probs_1d: np.ndarray, topk: int = 3) -> Dict[str, Any]:
+        order = np.argsort(-probs_1d)[:topk]
+        preds = []
+        for i in order:
+            preds.append({
+                "label": self.idx2label[int(i)],
+                "confidence": float(probs_1d[int(i)]),
+            })
+        top_conf = float(preds[0]["confidence"]) if preds else 0.0
+        uncertain = top_conf < self.cfg.confidence_threshold
+        return {
+            "predictions": preds,
+            "top_confidence": top_conf,
+            "uncertain": uncertain,
+        }
+
+
+# ==============================================================================
+# 14) AGENT 11 — EXPORT AGENT
+# ==============================================================================
+
+class ExportAgent:
+    """
+    Exports:
+    - best model checkpoint
+    - labels.json
+    - manifest.json
+    - temperature_scaler.pt (if exists)
+    """
+    def __init__(self, cfg: TrainConfig):
+        self.cfg = cfg
+
+    def run(
+        self,
+        run_dir: str,
+        best_model_path: str,
+        label2idx: Dict[str, int],
+        idx2label: Dict[int, str],
+        temperature_info: Optional[Dict[str, Any]]
+    ) -> str:
+        export_dir = os.path.join(run_dir, "export")
+        ensure_dir(export_dir)
+
+        # model ckpt
+        export_model = os.path.join(export_dir, "model_best.pt")
+        ckpt = torch.load(best_model_path, map_location="cpu")
+        torch.save(ckpt, export_model)
+
+        # labels
+        labels_path = os.path.join(export_dir, "labels.json")
+        save_json({
+            "label2idx": label2idx,
+            "idx2label": {str(k): v for k, v in idx2label.items()}
+        }, labels_path)
+
+        # temp scaler
+        temp_exported = None
+        temp_value = None
+        ece_raw = None
+        ece_cal = None
+
+        if temperature_info and "path" in temperature_info and os.path.exists(temperature_info["path"]):
+            tckpt = torch.load(temperature_info["path"], map_location="cpu")
+            temp_exported = os.path.join(export_dir, "temperature_scaler.pt")
+            torch.save(tckpt, temp_exported)
+            temp_value = float(tckpt.get("temperature", 1.0))
+            ece_raw = float(tckpt.get("ece_raw", -1))
+            ece_cal = float(tckpt.get("ece_cal", -1))
+
+        # manifest
+        manifest = {
+            "task": "dermnet_skin_disease",
+            "export_time": now_ts(),
+            "model_name": self.cfg.model_name,
+            "img_size": self.cfg.img_size,
+            "min_samples_per_class": self.cfg.min_samples_per_class,
+            "confidence_threshold": self.cfg.confidence_threshold,
+            "model_ckpt": "export/model_best.pt",
+            "labels": "export/labels.json",
+            "temperature_scaler": "export/temperature_scaler.pt" if temp_exported else None,
+            "temperature": temp_value,
+            "ece_raw": ece_raw,
+            "ece_cal": ece_cal,
+            "disclaimer": "AI suggestion only. Not a medical diagnosis."
+        }
+
+        manifest_path = os.path.join(export_dir, "manifest.json")
+        save_json(manifest, manifest_path)
+
+        print(f"[ExportAgent] ✅ Export complete -> {export_dir}")
+        return export_dir
+
+
+# ==============================================================================
+# 15) INFERENCE HELPER (USED BY API / LARAVEL INTEGRATION)
+# ==============================================================================
+
+class InferenceHelper:
+    """
+    Loads exported artifacts and predicts:
+    - from file path
+    - from raw bytes (perfect for Laravel upload → Python API)
+
+    Includes:
+    - optional skin gate
+    - temperature scaling
+    - top-k + uncertain decision
+    """
+
+    def __init__(self, export_dir: str, device: Optional[str] = None):
+        self.export_dir = export_dir
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        labels_path = os.path.join(export_dir, "labels.json")
+        manifest_path = os.path.join(export_dir, "manifest.json")
+        model_path = os.path.join(export_dir, "model_best.pt")
+
+        if not (os.path.exists(labels_path) and os.path.exists(manifest_path) and os.path.exists(model_path)):
+            raise FileNotFoundError("Export directory missing required files (labels.json, manifest.json, model_best.pt).")
+
+        labels_data = load_json(labels_path)
+        self.label2idx = labels_data["label2idx"]
+        self.idx2label = {int(k): v for k, v in labels_data["idx2label"].items()}
+        self.num_classes = len(self.idx2label)
+
+        self.manifest = load_json(manifest_path)
+        self.img_size = int(self.manifest["img_size"])
+        self.conf_threshold = float(self.manifest["confidence_threshold"])
+        self.skin_gate_enabled = bool(self.manifest.get("skin_gate_enabled", True))
+
+        # load model
+        cfg_model = TrainConfig(
+            img_size=self.img_size,
+            model_name=self.manifest.get("model_name", "efficientnet_b3"),
+            pretrained=False
+        )
+        self.model = ModelAgent(cfg_model, self.num_classes).run()
+
+        ckpt = torch.load(model_path, map_location=self.device)
+        self.model.load_state_dict(ckpt["model_state"])
+        self.model.to(self.device).eval()
+
+        # load temperature
+        self.temperature = None
+        tp = os.path.join(export_dir, "temperature_scaler.pt")
+        if os.path.exists(tp):
+            tckpt = torch.load(tp, map_location="cpu")
+            self.temperature = float(tckpt.get("temperature", 1.0))
+
+        # transforms
+        self.eval_tf = T.Compose([
+            T.Resize((self.img_size, self.img_size)),
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+
+        cfg_safety = TrainConfig(confidence_threshold=self.conf_threshold)
+        self.safety = SafetyDecisionAgent(cfg_safety, self.idx2label)
+        self.skin_gate = SkinPresenceAgent()
+
+    def _predict_pil(self, img: Image.Image, topk: int = 3) -> Dict[str, Any]:
+        if self.skin_gate_enabled:
+            if not self.skin_gate.is_likely_skin(img):
+                return {
+                    "error": "Input does not look like a skin photo (safety gate).",
+                    "predictions": [],
+                    "uncertain": True,
+                    "disclaimer": "AI suggestion only. Not a medical diagnosis."
+                }
+
+        x = self.eval_tf(img.convert("RGB")).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            logits = self.model(x).detach().cpu().numpy()[0]
+
+        if self.temperature is not None:
+            logits = logits / max(self.temperature, 1e-6)
+
+        probs = softmax_numpy(logits.reshape(1, -1), axis=1)[0]
+        decision = self.safety.decide(probs, topk=topk)
+        decision["temperature"] = float(self.temperature) if self.temperature is not None else None
+        decision["disclaimer"] = "AI suggestion only. Not a medical diagnosis."
+        return decision
+
+    def predict_path(self, image_path: str, topk: int = 3) -> Dict[str, Any]:
+        img = Image.open(image_path)
+        return self._predict_pil(img, topk=topk)
+
+    def predict_bytes(self, image_bytes: bytes, topk: int = 3) -> Dict[str, Any]:
+        img = Image.open(io.BytesIO(image_bytes))
+        return self._predict_pil(img, topk=topk)
+
+
+# ==============================================================================
+# 16) MULTI-AGENT ORCHESTRATOR
+# ==============================================================================
+
+class TrainingOrchestrator:
+    """
+    Runs full pipeline:
+    - Index (with rare-class filtering)
+    - Split
+    - Dataloaders
+    - Train
+    - Evaluate
+    - Calibrate
+    - Export
+    """
+
+    def __init__(self, cfg: TrainConfig):
+        self.cfg = cfg
+        self.run_dir = os.path.join(cfg.out_root, cfg.run_name)
+        self.artifacts_dir = os.path.join(self.run_dir, "artifacts")
+        self.metrics_dir = os.path.join(self.run_dir, "metrics")
+
+        ensure_dir(self.run_dir)
+        ensure_dir(self.artifacts_dir)
+        ensure_dir(self.metrics_dir)
+
+        save_json(asdict(cfg), os.path.join(self.run_dir, "config.json"))
+
+    def build_loaders(
+        self,
+        paths: List[str],
+        labels: np.ndarray,
+        train_idx: np.ndarray,
+        val_idx: np.ndarray,
+        test_idx: np.ndarray,
+        train_tf: T.Compose,
+        eval_tf: T.Compose,
+        num_classes: int
+    ) -> Tuple[DataLoader, DataLoader, DataLoader, torch.Tensor]:
+        tr_paths = [paths[i] for i in train_idx]
+        va_paths = [paths[i] for i in val_idx]
+        te_paths = [paths[i] for i in test_idx]
+
+        tr_labels = labels[train_idx]
+        va_labels = labels[val_idx]
+        te_labels = labels[test_idx]
+
+        ds_train = DermNetDataset(tr_paths, tr_labels, train_tf)
+        ds_val = DermNetDataset(va_paths, va_labels, eval_tf)
+        ds_test = DermNetDataset(te_paths, te_labels, eval_tf)
+
+        imbalance = ClassImbalanceAgent(self.cfg)
+        class_weights = imbalance.compute_class_weights(tr_labels, num_classes)
+
+        if self.cfg.use_weighted_sampler:
+            sampler = imbalance.build_sampler(tr_labels)
+            train_loader = DataLoader(
+                ds_train,
+                batch_size=self.cfg.batch_size,
+                sampler=sampler,
+                num_workers=self.cfg.num_workers,
+                pin_memory=self.cfg.pin_memory
+            )
+        else:
+            train_loader = DataLoader(
+                ds_train,
+                batch_size=self.cfg.batch_size,
+                shuffle=True,
+                num_workers=self.cfg.num_workers,
+                pin_memory=self.cfg.pin_memory
+            )
+
+        val_loader = DataLoader(
+            ds_val,
+            batch_size=self.cfg.batch_size,
+            shuffle=False,
+            num_workers=self.cfg.num_workers,
+            pin_memory=self.cfg.pin_memory
+        )
+
+        test_loader = DataLoader(
+            ds_test,
+            batch_size=self.cfg.batch_size,
+            shuffle=False,
+            num_workers=self.cfg.num_workers,
+            pin_memory=self.cfg.pin_memory
+        )
+
+        return train_loader, val_loader, test_loader, class_weights
+
+    def run_all(self, do_train: bool, do_calibrate: bool, do_export: bool) -> None:
+        seed_everything(self.cfg.seed)
+
+        print(f"[Orchestrator] device={self.cfg.device}")
+        print(f"[Orchestrator] run_dir={self.run_dir}")
+        print(f"[Orchestrator] data_dir={self.cfg.data_dir}")
+
+        # 1) Index
+        index_agent = DatasetIndexAgent(self.cfg)
+        paths, labels, label2idx, idx2label, meta = index_agent.run(enable_dedup=True)
+        save_json(meta, os.path.join(self.metrics_dir, "dataset_meta.json"))
+
+        num_classes = len(label2idx)
+        if num_classes < 2:
+            raise RuntimeError("After filtering, less than 2 classes remain. Lower min_samples_per_class or fix dataset.")
+
+        # 2) Split
+        split_agent = SplitAgent(self.cfg)
+        train_idx, val_idx, test_idx = split_agent.run(labels)
+        split_path = split_agent.save(self.metrics_dir, train_idx, val_idx, test_idx)
+        print(f"[Orchestrator] splits saved -> {split_path}")
+
+        # 3) Transforms
+        tf_agent = TransformAgent(self.cfg)
+        train_tf = tf_agent.train_tf()
+        eval_tf = tf_agent.eval_tf()
+
+        # 4) Loaders
+        train_loader, val_loader, test_loader, class_weights = self.build_loaders(
+            paths, labels, train_idx, val_idx, test_idx, train_tf, eval_tf, num_classes
+        )
+
+        # 5) Model
+        model = ModelAgent(self.cfg, num_classes).run()
+
+        # 6) Train
+        best_model_path = os.path.join(self.artifacts_dir, "best_model.pt")
+        history: List[EpochMetrics] = []
+
+        if do_train:
+            trainer = TrainingAgent(self.cfg)
+            model, history, best_model_path = trainer.run(
+                model=model,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                num_classes=num_classes,
+                out_dir=self.artifacts_dir,
+                class_weights=class_weights
+            )
+            save_json([asdict(h) for h in history], os.path.join(self.metrics_dir, "history.json"))
+        else:
+            if os.path.exists(best_model_path):
+                ckpt = torch.load(best_model_path, map_location=self.cfg.device)
+                model.load_state_dict(ckpt["model_state"])
+                model.to(self.cfg.device).eval()
+                print(f"[Orchestrator] loaded existing best model -> {best_model_path}")
+            else:
+                raise RuntimeError("No training requested and no existing best_model.pt found.")
+
+        # 7) Evaluate
+        eval_agent = EvaluationAgent(self.cfg, idx2label)
+        val_metrics = eval_agent.run(model, val_loader, "Validation", self.metrics_dir)
+        test_metrics = eval_agent.run(model, test_loader, "Test", self.metrics_dir)
+        save_json({"val": val_metrics, "test": test_metrics}, os.path.join(self.metrics_dir, "summary_metrics.json"))
+
+        # 8) Calibrate
+        temperature_info = None
+        if do_calibrate:
+            y_val, logits_val = eval_agent.predict_logits(model, val_loader)
+            cal_agent = CalibrationAgent(self.cfg)
+            temperature_info = cal_agent.run(logits_val, y_val, self.artifacts_dir)
+            save_json(temperature_info, os.path.join(self.metrics_dir, "calibration.json"))
+
+        # 9) Export
+        if do_export:
+            export_dir = ExportAgent(self.cfg).run(
+                run_dir=self.run_dir,
+                best_model_path=best_model_path,
+                label2idx=label2idx,
+                idx2label=idx2label,
+                temperature_info=temperature_info
+            )
+            print(f"[Orchestrator] export_dir -> {export_dir}")
+
+            # quick demo inference result (writes JSON)
+            helper = InferenceHelper(export_dir=export_dir, device=self.cfg.device)
+            sample = paths[int(test_idx[0])]
+            demo = helper.predict_path(sample, topk=3)
+            demo["sample_image"] = sample
+            save_json(demo, os.path.join(self.metrics_dir, "inference_demo.json"))
+            print("[Orchestrator] inference demo saved -> metrics/inference_demo.json")
+
+        print("\n[Orchestrator] ✅ DONE.")
+
+
+# ==============================================================================
+# 17) CLI (NOTEBOOK SAFE)
+# ==============================================================================
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="DermNet multi-agent skin disease detection (600+ lines)")
+
+    p.add_argument("--data_dir", type=str, default=None)
+    p.add_argument("--out_root", type=str, default=None)
+    p.add_argument("--run_name", type=str, default=None)
+
+    p.add_argument("--img", type=int, default=None)
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--batch", type=int, default=None)
+    p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--min_per_class", type=int, default=None)
+
+    p.add_argument("--no-amp", action="store_true")
+    p.add_argument("--no-weighted-sampler", action="store_true")
+
+    p.add_argument("--train", action="store_true")
+    p.add_argument("--calibrate", action="store_true")
+    p.add_argument("--export", action="store_true")
+
+    # NOTEBOOK SAFE: ignore unknown args (like -f in Jupyter)
+    return p.parse_known_args()[0]
+
+
+def main():
+    args = parse_args()
+    cfg = TrainConfig()
+
+    if args.data_dir is not None:
+        cfg.data_dir = args.data_dir
+    if args.out_root is not None:
+        cfg.out_root = args.out_root
+    if args.run_name is not None:
+        cfg.run_name = args.run_name
+
+    if args.img is not None:
+        cfg.img_size = args.img
+    if args.epochs is not None:
+        cfg.epochs = args.epochs
+    if args.batch is not None:
+        cfg.batch_size = args.batch
+    if args.lr is not None:
+        cfg.lr = args.lr
+    if args.min_per_class is not None:
+        cfg.min_samples_per_class = args.min_per_class
+
+    if args.no_amp:
+        cfg.use_amp = False
+    if args.no_weighted_sampler:
+        cfg.use_weighted_sampler = False
+
+    # default: do everything
+    if not (args.train or args.calibrate or args.export):
+        args.train = True
+        args.calibrate = True
+        args.export = True
+
+    orchestrator = TrainingOrchestrator(cfg)
+    orchestrator.run_all(
+        do_train=args.train,
+        do_calibrate=args.calibrate,
+        do_export=args.export
+    )
+
+
+if __name__ == "__main__":
+    main()
